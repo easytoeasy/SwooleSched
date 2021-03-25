@@ -1,0 +1,6 @@
+
+/verdor/
+/src/cache/
+/src/childsPids.pid
+# composer.json
+composer.lock
