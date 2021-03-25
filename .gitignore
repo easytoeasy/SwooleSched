@@ -1,5 +1,4 @@
-/vendor/
+/vendor
 /src/cache/
 /src/childsPids.pid
-composer.lock
 
