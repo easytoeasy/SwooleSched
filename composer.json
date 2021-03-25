@@ -3,5 +3,10 @@
         "psr-4": {
             "pzr\\swoolesched\\": "src"
         }
+    },
+    "require": {
+        "dragonmantank/cron-expression": "^3.1",
+        "doctrine/dbal": "^3.0",
+        "monolog/monolog": "^2.2"
     }
 }

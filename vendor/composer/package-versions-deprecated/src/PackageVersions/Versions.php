@@ -42,7 +42,7 @@ final class Versions
   'psr/log' => '1.1.3@0f73288fd15629204f9d42b7055f72dacbe811fc',
   'symfony/polyfill-ctype' => 'v1.22.1@c6c942b1ac76c82448322025e084cadc56048b4e',
   'webmozart/assert' => '1.10.0@6964c76c7804814a842473e0c8fd15bab0f18e25',
-  '__root__' => 'dev-main@da7cf308487bcacb26459aee7ba566934718aa65',
+  '__root__' => 'dev-main@fd6feb6f1f6b0a342835d2aeb3220281481e7752',
 );
 
     private function __construct()
