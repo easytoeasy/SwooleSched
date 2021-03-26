@@ -78,25 +78,17 @@ class Processor
             exit(3);
         }
 
+        $sigHandler = function($signo) {
+            // if ($this->childpids)
+            //     file_put_contents($this->saveChildpids, json_encode($this->childpids));
+            $this->logger->warning('parent exitCode ' . $signo);
+            exit(0);
+        };
+
         /* Swoole 安全退出时会等待所有子进程退出再退出。*/
-        Process::signal(SIGTERM, function ($signo) {
-            // if ($this->childpids)
-            //     file_put_contents($this->saveChildpids, json_encode($this->childpids));
-            $this->logger->warning('parent exitCode ' . $signo);
-            exit(0);
-        });
-        Process::signal(SIGINT, function ($signo) {
-            // if ($this->childpids)
-            //     file_put_contents($this->saveChildpids, json_encode($this->childpids));
-            $this->logger->warning('parent exitCode ' . $signo);
-            exit(0);
-        });
-        Process::signal(SIGQUIT, function ($signo) {
-            // if ($this->childpids)
-            //     file_put_contents($this->saveChildpids, json_encode($this->childpids));
-            $this->logger->warning('parent exitCode ' . $signo);
-            exit(0);
-        }); 
+        Process::signal(SIGTERM, $sigHandler);
+        Process::signal(SIGINT, $sigHandler);
+        Process::signal(SIGQUIT, $sigHandler); 
 
         file_put_contents($this->pidfile, getmypid());
 
