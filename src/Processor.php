@@ -78,6 +78,7 @@ class Processor
         $socket = new Co\Socket(AF_INET, SOCK_STREAM, 0);
         $socket->setOption(SOL_SOCKET, SO_REUSEADDR, 1);
         $socket->setOption(SOL_SOCKET, SO_REUSEPORT, 1);
+        $socket->setOption(SOL_SOCKET, SO_KEEPALIVE, 1);
         if ($socket->bind(HOST, PORT) === false) {
             echo 'socket errcode:' . $socket->errCode . PHP_EOL;
             $socket->close();
@@ -371,7 +372,7 @@ class Processor
         $retval = $client->recv();
         if ($retval === false || $retval === '') {
             Event::del($client);
-            $client->close();
+            // $client->close();
         } else {
             go(function () use ($client, $retval) {
                 Http::parseHttp($retval);
@@ -379,7 +380,7 @@ class Processor
                 $client->send($this->display());
                 // 没有keepalive，数据响应结束就关闭了。
                 // 但是启用了 HTTP 的 max-age 缓存。
-                Event::del($client);
+                // Event::del($client);
             });
         }
     }
