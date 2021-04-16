@@ -31,6 +31,8 @@ class Processor
     /** 记录主进程启动的时间 */
     protected $createAt;
     protected $logger;
+    /* 黑洞实现 */
+    protected $fd;
     /** 保存父进程退出之前的子进程pid */
     // protected $saveChildpids = __DIR__ . '/childsPids.pid';
     // protected $preChildpids = array();
@@ -39,6 +41,7 @@ class Processor
 
     public function __construct()
     {
+        global $STDOUT, $STDERR;
         $this->createAt = date('Y-m-d H:i');
         $this->_getLocalip();
         $this->_parseIni();
@@ -46,6 +49,19 @@ class Processor
         $this->logger = new Logger('SwooleSched');
         $this->logger->pushHandler(new StreamHandler($this->logfile), Logger::WARNING);
         $this->logger->info('host:' . HOST . ', port:' . PORT);
+        // @see https://blog.csdn.net/xuxuer/article/details/84882846
+        // 在主进程内的输出会被重定向到fd
+        if ($this->logfile) {
+            $fd = fopen($this->logfile, 'wb');
+        } else {
+            $fd = fopen('/dev/null', 'r');
+        }
+        if (!$fd) {
+            exit(3);
+        }
+        $STDOUT = $fd;
+        $STDERR = $fd;
+        $this->fd = $fd;
     }
 
     public function run()
@@ -64,31 +80,52 @@ class Processor
         $socket->setOption(SOL_SOCKET, SO_REUSEPORT, 1);
         if ($socket->bind(HOST, PORT) === false) {
             echo 'socket errcode:' . $socket->errCode . PHP_EOL;
+            $socket->close();
+            fclose($this->fd);
             exit(3);
         }
 
+        /* backlog 解释
+         * TCP 3次握手状态：SYN_SEND、SYN_RCV、ESTABLISHED
+         * 在客户端发起连接时，服务端维持处于SYN_RCV状态的连接并且最大数量是backlog。
+         * 如果超过backlog的数量那么客户端的连接会被拒绝。*/
         if ($socket->listen($this->backlog) === false) {
             echo 'socket errcode:' . $socket->errCode . PHP_EOL;
+            $socket->close();
+            fclose($this->fd);
             exit(3);
         }
 
         /* Event::add会自动将底层改成非阻塞模式 */
         if (Event::add($socket, [$this, 'acceptHandler']) === false) {
             echo 'socket errcode:' . $socket->errCode . PHP_EOL;
+            $socket->close();
             exit(3);
         }
 
-        $sigHandler = function($signo) {
+        $sigHandler = function ($signo) use ($socket) {
             // if ($this->childpids)
             //     file_put_contents($this->saveChildpids, json_encode($this->childpids));
-            $this->logger->warning('parent exitCode ' . $signo);
-            exit(0);
+
+            // 协程内写日志，会导致协程切换。
+            // $this->logger->warning('parent exitCode ' . $signo);
+
+            // 进程内使用exit会使进程立即退出。
+            // exit(0);
+
+            try {
+                $socket->close();
+                fclose($this->fd);
+                exit(0);
+            } catch (Swoole\ExitException $e) {
+                echo $e->getMessage() . "\n";
+            }
         };
 
         /* Swoole 安全退出时会等待所有子进程退出再退出。*/
         Process::signal(SIGTERM, $sigHandler);
         Process::signal(SIGINT, $sigHandler);
-        Process::signal(SIGQUIT, $sigHandler); 
+        Process::signal(SIGQUIT, $sigHandler);
 
         file_put_contents($this->pidfile, getmypid());
 
@@ -109,7 +146,7 @@ class Processor
                 $this->outofMin++;
             }
             // 类似黑洞
-            file_put_contents($this->stdout, '');
+            // file_put_contents($this->stdout, '');
             $this->_startJobs();
             $next = $stamp + $wait;
         }
@@ -119,18 +156,19 @@ class Processor
     {
         foreach ($this->jobs as $md5 => $job) {
             if ($this->isAllowedRun($job)) {
-                /* 协程不能引入传递 */
-                go(function () use ($md5, $job) {
+                /* 协程不能引入传递？但如果我就是想修改job呢？ */
+                go(function () use ($md5, &$job) {
                     if ($job->state == State::RUNNING) {
                         return;
                     }
+                    // 这里是将子进程的输出重定向到了stdout文件，能不能重定向到黑洞呢？
                     $stdout = $job->output ?: $this->stdout;
                     $stderr = $job->stderr ?: $this->stdout;
                     $proc = proc_open('exec ' . $job->command, [
                         1 => ['file', $stdout, 'a'],
                         2 => ['file', $stderr, 'a'],
                     ], $pipes);
-                    $job = &$this->jobs[$md5];
+                    // $job = &$this->jobs[$md5];
                     if ($proc) {
                         $st = proc_get_status($proc);
                         if ($st['running'] === false) {
@@ -138,15 +176,15 @@ class Processor
                             proc_close($proc);
                             return;
                         }
-                        $this->logger->info($job->id . ' start at ' . date('Y-m-d H:i'));
                         $job->pid = $st['pid'];
                         $this->childpids[$job->pid] = $md5;
                         $job->state = State::RUNNING;
                         $job->refcount++;
+                        $this->logger->info($job->id . ' start at ' . date('Y-m-d H:i'));
                         /* (1) 在非协程下，加上proc_close这行就会导致阻塞。
-                         *      PHP手册提到这个函数会等待直到结束。
-                         * (2) 但是在Swoole + 协程下，就是异步的了。
-                         *      记得：hook + proc_open */
+                        *      PHP手册提到这个函数会等待直到结束。
+                        * (2) 但是在Swoole + 协程下，就是异步的了。
+                        *      记得：hook + proc_open */
                         $code = proc_close($proc);
                         unset($this->childpids[$job->pid]);
                         $job->pid = 0;
@@ -339,6 +377,8 @@ class Processor
                 Http::parseHttp($retval);
                 $this->handle();
                 $client->send($this->display());
+                // 没有keepalive，数据响应结束就关闭了。
+                // 但是启用了 HTTP 的 max-age 缓存。
                 Event::del($client);
             });
         }
@@ -454,6 +494,9 @@ class Processor
 // error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING);
 require './../vendor/autoload.php';
 
+fclose(STDOUT);
+fclose(STDERR);
+
 $server_id = $argv[1];
 if (empty($server_id)) {
     echo 'invalid value of server_id' . PHP_EOL;
@@ -469,10 +512,10 @@ define('SERVER_ID', $server_id);
 //     }
 // });
 
-
-
-$process = new Process(function () {
-    $obj = new Processor();
+$obj = new Processor();
+$process = new Process(function () use ($obj) {
+    Process::daemon();
+    cli_set_process_title('SwooleSched ' . SERVER_ID);
     $obj->run();
 });
 $process->start();

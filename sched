@@ -1,0 +1,96 @@
+#!/bin/sh
+
+workdir=$(
+    cd $(dirname $0)
+    pwd
+)
+prog=$workdir/src/Processor.php
+server_id=$2
+name="SwooleSched $server_id"
+exec=/usr/local/php7.3/bin/php
+pidfile=/var/run/swoolesched$server_id.pid
+logfile=/var/log/swoolesched$server_id.log
+
+# -z 判断 string 是否是空串
+# -n 判断 string 是否是非空串
+[ -z $2 ] && {
+    echo "empty of server_id"
+    exit 4
+}
+
+if [ $server_id -le 0 ]; then
+    echo "invalid value of server_id: $2."
+    exit 4
+fi
+
+start() {
+    if [ $UID -ne 0 ]; then
+        echo "User has insufficient privilege."
+        exit 4
+    fi
+    [ -x $exec ] || {
+        echo "can't execute:$exec"
+        exit 5
+    }
+    # echo $"Starting $name: "
+    $exec $prog $server_id >>$logfile 2>&1
+    retval=$?
+    [ $retval -eq 0 ] && echo "Start OK"
+}
+
+stop() {
+    if [ $UID -ne 0 ]; then
+        echo "User has insufficient privilege."
+        exit 4
+    fi
+    if [ ! -f $pidfile ]; then
+        echo "has no such pidfile:$pidfile."
+        return
+    fi
+    echo $"Stopping $name: "
+    pid=$(cat $pidfile)
+    if [ -n "$(ps aux | awk '{print $2}' | grep -w $pid)" ]; then
+        rs=$(kill -15 $pid)
+        [ -n $rs ]
+        retval=$?
+        [ $retval -eq 0 ] && echo "Stopped OK"
+    else
+        echo $"Stopping Failed"
+        RETVAL=3
+    fi
+}
+
+status() {
+    if [ ! -f $pidfile ]; then
+        echo "has no such pidfile:$pidfile."
+        exit 4
+    fi
+
+    pid=$(cat $pidfile)
+    if [ -n "$(ps aux | awk '{print $2}' | grep -w $pid)" ]; then
+        echo "$name pid:$pid is running..."
+    else
+        echo "$name is stopped."
+    fi
+}
+
+case "$1" in
+start)
+    $1
+    ;;
+stop)
+    $1
+    ;;
+restart)
+    stop
+    start
+    ;;
+status)
+    $1
+    ;;
+*)
+    echo $"Usage: $0 {start|stop|restart|status}"
+    exit 2
+    ;;
+esac
+exit $?
