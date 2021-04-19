@@ -2,7 +2,7 @@
 
 namespace pzr\swoolesched;
 
-define('PHP_EOL', "\r\n");
+defined('PHP_EOL') ?: define('PHP_EOL', "\r\n");
 
 class Http
 {
@@ -111,45 +111,36 @@ class Http
 
     public static function status_404()
     {
-        $keepalive = '';
-        if ($_SERVER['HTTP_CONNECTION'] == 'keep-alive') {
-            $keepalive = 'Connection: Keep-Alive';
-        }
+        $header = $_SERVER['HTTP_CONNECTION'] == 'keep-alive' ? 'Connection: keep-alive' : '';
         return <<<EOF
 HTTP/1.1 404 OK
 content-type: text/html
-$keepalive
+$header
 
 EOF;
     }
 
     public static function status_301($location)
     {
-        $keepalive = '';
-        if ($_SERVER['HTTP_CONNECTION'] == 'keep-alive') {
-            $keepalive = 'Connection: Keep-Alive';
-        }
+        $header = $_SERVER['HTTP_CONNECTION'] == 'keep-alive' ? 'Connection: keep-alive' : '';
         return <<<EOF
 HTTP/1.1 301 Moved Permanently
 Content-Length: 0
 Content-Type: text/plain
 Location: $location
 Cache-Control: no-cache
-$keepalive
+$header
 
 EOF;
     }
 
     public static function status_304()
     {
-        $keepalive = '';
-        if ($_SERVER['HTTP_CONNECTION'] == 'keep-alive') {
-            $keepalive = 'Connection: Keep-Alive';
-        }
+        $header = $_SERVER['HTTP_CONNECTION'] == 'keep-alive' ? 'Connection: keep-alive' : '';
         return <<<EOF
 HTTP/1.1 304 Not Modified
 Content-Length: 0
-$keepalive
+$header
 
 EOF;
     }
@@ -162,7 +153,8 @@ EOF;
         }
         $contentType = $_SERVER['CONTENT_TYPE'];
         $length = strlen($response);
-        $header .= $contentType ? 'Cache-Control: max-age=180' : '';
+        $header .= $contentType == '' || $contentType == 'text/html'
+            ? '' : 'Cache-Control: max-age=180';
         // $etag = md5($response);
         // ETag: $etag
         return <<<EOF
