@@ -28,7 +28,8 @@ class Processor
     protected $beDelIds = array();
     /** 记录主进程启动的时间 */
     protected $createAt;
-    protected $logger;
+    // protected $logger;
+    protected $level;
     /* 黑洞实现 */
     protected $stdout_fd;
     protected $stderr_fd;
@@ -59,6 +60,7 @@ class Processor
         }
         $this->nullfd = fopen('/dev/null', 'r');
 
+        Logger::$level = $this->level;
         Logger::info('host:' . HOST . ', port:' . PORT);
 
         // $this->channel = new Co\Channel(1);
@@ -339,14 +341,14 @@ class Processor
             exit(3);
         }
 
-        if ($ini['pidfile'])
-            $this->pidfile = $ini['pidfile'];
-        if ($ini['logfile'])
-            $this->logfile = $ini['logfile'];
-        if ($ini['stdout'])
-            $this->output = $ini['stdout'];
-        if (isset($ini['backlog']))
-            $this->backlog = $ini['backlog'];
+        $this->pidfile = $ini['pidfile'] ?? '';
+        $this->logfile = $ini['logfile'] ?? '';
+        $this->output = $ini['stdout'] ?? '';
+        $this->backlog = $ini['backlog'] ?? 16;
+        $this->level = $ini['loglevel'] ?? Logger::INFO;
+        if (!array_key_exists($this->level, Logger::getLevels())) {
+            $this->level = Logger::INFO;
+        }
 
         $this->pidfile = str_replace('{%d}', SERVER_ID, $this->pidfile);
         $this->logfile = str_replace('{%d}', SERVER_ID, $this->logfile);

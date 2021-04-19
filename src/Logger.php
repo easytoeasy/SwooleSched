@@ -12,20 +12,19 @@ class Logger
 
     public static $level = self::INFO;
 
+    public static function getLevels()
+    {
+        return [
+            self::DEBUG => 'DEBUG',
+            self::WARNING => 'WARNING',
+            self::INFO => 'INFO',
+            self::ERROR => 'ERROR',
+        ];
+    }
+
     public static function getName($level)
     {
-        switch($level) {
-            case 1:
-                return 'DEBUG';
-            case 1 << 1:
-                return 'WARNING';
-            case 1 << 2:
-                return 'INFO';
-            case 1 << 3:
-                return 'ERROR';
-            default:
-                return 'UNKNOW';
-        }
+        return self::getLevels()[$level];
     }
 
     public static function debug($msg)
