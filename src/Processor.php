@@ -7,6 +7,7 @@ use Exception;
 use Swoole\Process;
 use Swoole\Coroutine as Co;
 use Swoole\Event;
+use Swoole\Timer;
 use Throwable;
 
 class Processor
@@ -21,8 +22,8 @@ class Processor
     protected $stdout  = '/var/log/stdout{%d}.log';
 
     protected $message = 'Init Process OK';
-    protected $outofMin = -1;
-    protected $extSeconds = 3;
+    protected $outofMin = 0;
+    protected $extSeconds = 1;
     protected $childpids = array();
     /** 由于DB记录改变，内存中即将被删除的命令 */
     protected $beDelIds = array();
@@ -34,6 +35,9 @@ class Processor
     protected $stdout_fd;
     protected $stderr_fd;
     protected $nullfd;
+    protected $timerIds = array();
+    protected $socket;
+    protected $tick = 1000; //时间事件(ms)+文件事件
     // protected $channel;
     /** 保存父进程退出之前的子进程pid */
     // protected $saveChildpids = __DIR__ . '/childsPids.pid';
@@ -46,23 +50,28 @@ class Processor
         $this->createAt = date('Y-m-d H:i');
         $this->_getLocalip();
         $this->_parseIni();
-        $this->_initJobs();
-        // @see https://blog.csdn.net/xuxuer/article/details/84882846
-        // 在主进程内的stdout|stderr会被重定向到fd
-        // 在重定向stdout之前，不要输出数据到控制台，否则无法启动。
-        // 这就是为什么logger要放到重定向之后的原因。
+        // $this->_initJobs();
+
+        /* stdout 可以重定向，stderr无法重定向。*/
         if ($this->logfile) {
             $this->stdout_fd = fopen($this->logfile, 'wb');
             $this->stderr_fd = fopen($this->logfile, 'wb');
         } else {
-            $this->stdout_fd = fopen('/dev/null', 'r');
-            $this->stderr_fd = fopen('/dev/null', 'r');
+            $this->stdout_fd = fopen('/dev/null', 'w');
+            $this->stderr_fd = fopen('/dev/null', 'w');
         }
-        $this->nullfd = fopen('/dev/null', 'r');
+        /* /dev/null 可设置为 r+|w|w+|a|a+，不能设置为 r
+         * 不设置为可写的话，在不设置子进程的stdout时，子进程无法启动。 */
+        $this->nullfd = fopen('/dev/null', 'w');
+        if (!is_resource($this->nullfd)) {
+            Logger::error('nullfd created failed');
+            exit(3);
+        }
 
         Logger::$level = $this->level;
         Logger::info('host:' . HOST . ', port:' . PORT);
-
+        // 本来想处理完READ事件之后，将response数据写入channel
+        // 然后在WRITE事件中在从channel读取数据返回给HTTP。可是似乎不行，WHY？
         // $this->channel = new Co\Channel(1);
     }
 
@@ -80,15 +89,13 @@ class Processor
         $socket = new Co\Socket(AF_INET, SOCK_STREAM, 0);
         $socket->setOption(SOL_SOCKET, SO_REUSEADDR, 1);
         $socket->setOption(SOL_SOCKET, SO_REUSEPORT, 1);
-        // 不开启长连接，因为web请求并不多。但是调试要完整
+        // 不开启长连接，因为web请求并不多。但是调试要完整。调试结束
         // 开启keepalive后，start|stop 请求一直处于pedding。
+        // 已处理：HTTP 返回的header多加一空行。可能是因为Swoole的读取按\r\n的原因。
         $socket->setOption(SOL_SOCKET, SO_KEEPALIVE, 1);
         if ($socket->bind(HOST, PORT) === false) {
-            Logger::info('socket errcode:' . $socket->errCode . PHP_EOL);
-            $socket->close();
-            fclose($this->stdout_fd);
-            fclose($this->stderr_fd);
-            fclose($this->nullfd);
+            socket_close($socket);
+            Logger::info('socket errCode:' . $socket->errCode . PHP_EOL);
             exit(3);
         }
 
@@ -98,18 +105,15 @@ class Processor
          * 如果超过backlog的数量那么客户端的连接会被拒绝。
          * 除了backlog设置的队列外，系统还维护了ESTABLISHED的队列。*/
         if ($socket->listen($this->backlog) === false) {
+            socket_close($socket);
             Logger::info('socket errcode:' . $socket->errCode . PHP_EOL);
-            $socket->close();
-            fclose($this->stdout_fd);
-            fclose($this->stderr_fd);
-            fclose($this->nullfd);
             exit(3);
         }
 
         /* Event::add会自动将底层改成非阻塞模式 */
         if (Event::add($socket, [$this, 'acceptHandler']) === false) {
-            Logger::info('socket errcode:' . $socket->errCode . PHP_EOL);
             $socket->close();
+            Logger::info('socket errcode:' . $socket->errCode . PHP_EOL);
             exit(3);
         }
 
@@ -117,104 +121,130 @@ class Processor
             // if ($this->childpids)
             //     file_put_contents($this->saveChildpids, json_encode($this->childpids));
 
-            // 协程内写日志，会导致协程切换。
-            // $this->logger->warning('parent exitCode ' . $signo);
-
-            // 进程内使用exit会使进程立即退出。
+            // Swoole进程内使用exit会使进程立即退出。
             // exit(0);
 
             try {
-                $socket->close();
-                fclose($this->stdout_fd);
-                fclose($this->stderr_fd);
-                fclose($this->nullfd);
                 unlink($this->pidfile);
+                Logger::info('master Process exit code ' . $signo);
                 exit(0);
             } catch (Swoole\ExitException $e) {
-                Logger::info($e->getMessage() . "");
+                Logger::info($e->getMessage());
             }
         };
 
         /* Swoole 安全退出时会等待所有子进程退出再退出。*/
         Process::signal(SIGTERM, $sigHandler);
-        Process::signal(SIGINT, $sigHandler);
+        Process::signal(SIGINT,  $sigHandler);
         Process::signal(SIGQUIT, $sigHandler);
 
-        // file_put_contents($this->pidfile, getmypid());
+        file_put_contents($this->pidfile, getmypid());
+
+        // 会导致协程id一直增加，如果协程id写爆了怎么办？会重新从0开始吗？
+        Timer::tick($this->tick, function () {
+        });
 
         $wait = 60;
         $stamp = time();
         $next = 0;
-        // Co::set(['hook_flags' => SWOOLE_HOOK_ALL]);
         while (true) {
             do {
                 if ($stamp >= $next) {
                     break;
                 }
+                /* dispatch 等待事件的发生，需要定一个超时时间才好。
+                 * 但是API又没有找到设置超时时间的参数。在epollfd是支持定义超时时间的啊！
+                 * 为什么在Swoole没找到呢？最后使用时间事件+文件事件。类似Redis。 */
                 Event::dispatch();
                 $stamp = time();
             } while ($stamp < $next);
-            // 1min+5s内执行不完则记录
-            if ($stamp - $next > $wait + $this->extSeconds) {
+            $next = $stamp + $wait;
+            $this->_startJobs();
+            // 1min+1s内执行不完则记录
+            if (time() - $next > $wait + $this->extSeconds) {
                 $this->outofMin++;
             }
-            // 类似黑洞，如果触发协程呢会怎么样？所以改成了nullfd
-            // file_put_contents($this->stdout, '');
-            $this->_startJobs();
-            $next = $stamp + $wait;
         }
     }
 
     private function _startJobs()
     {
-        foreach ($this->jobs as $md5 => $job) {
-            if ($this->isAllowedRun($job)) {
-                /* 协程不能引入传递？但如果我就是想修改job呢？ */
-                go(function () use ($md5, &$job) {
-                    if ($job->state == State::RUNNING) {
-                        return;
-                    }
-                    // 这里是将子进程的输出重定向到了stdout文件，能不能重定向到黑洞呢？
-                    // 写日志会触发IO，会带来什么现象呢？
-                    // 观察到：
-                    $desc[1] = $job->output ? ['file', $job->output, 'a'] : $this->nullfd;
-                    $desc[2] = $job->stderr ? ['file', $job->stderr, 'a'] : $this->nullfd;
-
-                    try {
-                        $proc = proc_open('exec ' . $job->command, $desc, $pipes);
-                        if ($proc) {
-                            $st = proc_get_status($proc);
-                            if ($st['running'] === false) {
-                                $job->state = State::BACKOFF;
-                                proc_close($proc);
-                                return;
-                            }
-                            $job->pid = $st['pid'];
-                            $this->childpids[$job->pid] = $md5;
-                            $job->state = State::RUNNING;
-                            $job->refcount++;
-                            // $this->logger->info($job->id . ' start at ' . date('Y-m-d H:i'));
-                            /* (1) 在非协程下，加上proc_close这行就会导致阻塞。
-                            *      PHP手册提到这个函数会等待直到结束。
-                            * (2) 但是在Swoole + 协程下，就是异步的了。
-                            *      记得：hook + proc_open */
-                            $code = proc_close($proc);
-                            unset($this->childpids[$job->pid]);
-                            $job->pid = 0;
-                            $job->state = State::STOPPED;
-                            $job->refcount--;
-                        } else {
-                            $job->state = State::FATAL;
+        go(function () {
+            $this->syncFromDB();
+            foreach ($this->jobs as &$job) {
+                // 支持ms||s级任务,单位是ms
+                if (is_numeric($job->cron)) {
+                    if (isset($this->timerIds[$job->id]))
+                        continue;
+                    Logger::info('add timer event, job id is ' . $job->id);
+                    // Timer内会自动创建协程。
+                    Timer::tick($job->cron, function ($timerid) use ($job) {
+                        if (!isset($this->timerIds[$job->id])) {
+                            Logger::debug('timer id is ' . $timerid);
+                            $this->timerIds[$job->id] = $timerid;
                         }
-                    } catch (Exception $e) {
-                        $job->state = State::FATAL;
-                        Logger::info($e->getMessage());
-                        // 协程退出条件
-                        return false;
-                    }
-                });
+                        $this->fork($job);
+                    });
+                } else if ($this->isAllowedRun($job)) {
+                    /*
+                    由于在协程空间内 fork 进程会带着其他协程上下文，因此底层禁止了在 Coroutine 中使用 Process 模块。可以使用
+                    System::exec() 或 Runtime Hook+shell_exec 实现外面程序运行
+                    Runtime Hook+proc_open 实现父子进程交互通信
+                    */
+                    go(function () use ($job) {
+                        $this->fork($job);
+                    });
+                }
             }
+        });
+    }
+
+    protected function fork(Job $job)
+    {
+        if ($job->state == State::RUNNING || $job->state == State::DELETING) {
+            return;
         }
+
+        $desc[1] = $job->output ? ['file', $job->output, 'a'] : $this->nullfd;
+        $desc[2] = $job->stderr ? ['file', $job->stderr, 'a'] : $this->nullfd;
+        try {
+            $proc = proc_open($job->command, $desc, $pipes);
+            if ($proc) {
+                $st = proc_get_status($proc);
+                if ($st['running'] === false) {
+                    $job->state = State::BACKOFF;
+                    proc_close($proc);
+                    return;
+                }
+                $job->pid = $st['pid'];
+                $this->childpids[$job->pid] = $job->md5;
+                $job->state = State::RUNNING;
+                $job->refcount++;
+                $job->uptime = date('H:i:s');
+                // Logger::info($job->id . ' start');
+                /* (1) 在非协程下，加上proc_close这行就会导致阻塞。
+                *      PHP手册提到这个函数会等待直到结束。
+                * (2) 但是在Swoole + 协程下，就是异步的了。
+                *      记得：hook + proc_open */
+                $code = proc_close($proc);
+                // Logger::debug($job->id . ' proc_close exitCode: ' . $code);
+                unset($this->childpids[$job->pid]);
+                $job->pid = 0;
+                $job->refcount--;
+                $job->endtime = date('H:i:s');
+                if ($code != 0) {
+                    $job->state = State::UNKNOWN;
+                } else {
+                    $job->state = State::STOPPED;
+                }
+            } else {
+                $job->state = State::FATAL;
+            }
+        } catch (Exception $e) {
+            $job->state = State::FATAL;
+            Logger::error($e->getMessage());
+        }
+        return;
     }
 
     protected function syncFromDB()
@@ -223,21 +253,21 @@ class Processor
         $jobs = $db->getJobs();
         $this->servTags = $db->getServTags();
 
-        if ($this->preChildpids)
-            foreach ($this->preChildpids as $pid => $md5) {
-                if (!$this->isAlive($pid)) {
-                    ($this->jobs[$md5])->refcount--;
-                    unset($this->preChildpids[$pid]);
-                    if (empty($this->preChildpids)) {
-                        unlink($this->saveChildpids);
-                    }
-                }
-            }
+        // if ($this->preChildpids)
+        //     foreach ($this->preChildpids as $pid => $md5) {
+        //         if (!$this->isAlive($pid)) {
+        //             ($this->jobs[$md5])->refcount--;
+        //             unset($this->preChildpids[$pid]);
+        //             if (empty($this->preChildpids)) {
+        //                 unlink($this->saveChildpids);
+        //             }
+        //         }
+        //     }
 
-        /*
+
         if (empty($this->jobs)) {
             // 保护父进程退出后的子进程不会发生重复执行
-            if (
+            /*if (
                 is_file($this->saveChildpids) &&
                 ($saveChildPids = file_get_contents($this->saveChildpids))
             ) {
@@ -251,9 +281,9 @@ class Processor
                         $this->preChildpids[$pid] = $md5;
                     }
                 }
-            }
+            }*/
             $this->jobs = $jobs;
-        } */
+        }
 
 
 
@@ -267,15 +297,28 @@ class Processor
          * 正在运行的任务不能清除
          * 主进程每分钟跑一次，此时待删除的子进程可能需要运行数分钟。但是每分钟都会
          * 执行到这里。直到待删除的子进程全部结束。
+         * 
+         * 增加了ms级定时任务之后，因为这个逻辑是每分钟执行。
+         * 所以毫秒级的任务在改变之后，先直接把原来的定时任务删除。然后在新增
          */
         foreach ($beDels as $key => $value) {
             $c = &$this->jobs[$key];
-            if ($c->refcount > 0) {
+
+            // 毫秒级任务直接从定时任务删除
+            if (isset($this->timerIds[$c->id])) {
+                $timerid = $this->timerIds[$c->id];
+                if (Timer::clear($timerid)) {
+                    Logger::debug('clear timer id is ' . $timerid);
+                    unset($this->timerIds[$c->id]);
+                }
+            } else if ($c->refcount > 0) { // cron任务等待子任务跑完在删除
                 $this->beDelIds[$c->id] = $c->id;
                 $c->state = State::DELETING;
                 continue;
             }
-            unset($this->beDelIds[$c->id]);
+
+            if (in_array($c->id, $this->beDelIds))
+                unset($this->beDelIds[$c->id]);
             unset($this->jobs[$key]);
         }
 
@@ -345,9 +388,11 @@ class Processor
         $this->logfile = $ini['logfile'] ?? '';
         $this->output = $ini['stdout'] ?? '';
         $this->backlog = $ini['backlog'] ?? 16;
-        $this->level = $ini['loglevel'] ?? Logger::INFO;
-        if (!array_key_exists($this->level, Logger::getLevels())) {
+        $this->level = $ini['loglevel'] ?? '';
+        if (!array_key_exists($this->level, Logger::getNames())) {
             $this->level = Logger::INFO;
+        } else {
+            $this->level = Logger::getNames()[$this->level];
         }
 
         $this->pidfile = str_replace('{%d}', SERVER_ID, $this->pidfile);
@@ -380,6 +425,8 @@ class Processor
         define('HOST', $localip);
     }
 
+    // 注意如果监听了 SWOOLE_EVENT_READ 事件，而当前并未设置 read_callback，
+    // 底层会直接返回 false，添加失败。SWOOLE_EVENT_WRITE 同理。
     public function acceptHandler($socket)
     {
         $client = $socket->accept();
@@ -396,6 +443,8 @@ class Processor
             Event::del($client);
             $client->close();
         } else {
+            // 这里一定要加个子协程，保证handle处理后能够响应HTTP
+            // 特别是删除DB缓存涉及到IO，如果没有子协程则会被切到其他的协程。。
             go(function () use ($client, $retval) {
                 Http::parseHttp($retval);
                 $this->handle();
@@ -403,20 +452,19 @@ class Processor
                 // 好像是HTTP已经无法接收数据了。该怎么办呢？
                 // 最后发现是因为开启长连接之后，返回的301 HTTP header 要多加一行换行。
                 if ($client->checkLiveness() === false) {
-                    Logger::info('client has died');
+                    Logger::debug('client has died');
                     Event::del($client);
                     return;
                 }
 
                 if (($ret = $client->send($this->display())) === false) {
+                    if ($client->errCode == SOCKET_EAGAIN) {
+                        $ret = $client->send($this->display());
+                    }
+                }
+                if ($ret === false) {
                     Logger::error('client send errCode: ' . $client->errCode);
                 }
-
-                while ($client->errCode == SOCKET_EAGAIN) {
-                    $client->send($this->display());
-                }
-                // $this->channel->push($this->display());
-                // Event::set($client, null, [$this, 'writeToClient'], SWOOLE_EVENT_WRITE);
                 // 不开启keepalive，数据响应结束就关闭了。但是有 HTTP 的 max-age 缓存。
                 // 开启了keepalive，就不能再del了，因为会把长连接断开了。
                 if (!KEEPALIVE)
@@ -424,19 +472,6 @@ class Processor
             });
         }
     }
-
-    /*public function writeToClient($client)
-    {
-        go(function() use ($client) {
-            $html = $this->channel->pop();
-            if (!empty($html)) {
-                Logger::info (strlen($html));
-                $client->send($html);
-                Event::set($client, null, null, SWOOLE_EVENT_READ);
-                // Event::del($client);
-            }
-        });
-    }*/
 
     public function display()
     {
@@ -486,7 +521,7 @@ class Processor
         }
 
         if (!empty($action)) {
-            $info = $c ? $c->id : '';
+            $info = $c->id ?? '';
             $this->message = sprintf("%s %s at %s", $action, $info, date('Y-m-d H:i:s'));
         }
 
@@ -505,6 +540,7 @@ class Processor
             case 'flush':
                 $rs = $this->delTree(__DIR__ . '/cache');
                 $this->message .= ' result:' . intval($rs);
+                Logger::debug('flushed cache OK');
                 break;
             case 'clear':
                 $this->clearLog($this->logfile);
@@ -515,6 +551,15 @@ class Processor
             case 'clear_2':
                 $this->clearLog($c->stderr);
                 break;
+            case 'clearTimer':
+                if (isset($this->timerIds[$c->id])) {
+                    $timerId = $this->timerIds[$c->id];
+                    if (Timer::clear($timerId)) {
+                        Logger::info('clear timer id is ' . $timerId);
+                        unset($this->timerIds[$c->id]);
+                    }
+                }
+                break;
             default:
                 break;
         }
@@ -522,11 +567,15 @@ class Processor
 
     public function delTree($dir)
     {
-        $files = array_diff(scandir($dir), array('.', '..'));
-        foreach ($files as $file) {
-            (is_dir("$dir/$file")) ? $this->delTree("$dir/$file") : unlink("$dir/$file");
-        }
-        return rmdir($dir);
+        return `rm -rf $dir`;
+        // Logger::debug('start delTree');
+        // $files = array_diff(scandir($dir), array('.', '..'));
+        // Logger::debug('files: ' . print_r($files));
+        // Logger::debug('dir:' . $dir);
+        // foreach ($files as $file) {
+        //     (is_dir("$dir/$file")) ? $this->delTree("$dir/$file") : unlink("$dir/$file");
+        // }
+        // return rmdir($dir);
     }
 
     public function clearLog($logfile)
@@ -543,11 +592,19 @@ class Processor
         if (empty($pid)) return false;
         return `ps aux | awk '{print $2}' | grep -w $pid`;
     }
+
+    public function __destruct()
+    {
+        fclose($this->stdout_fd);
+        fclose($this->stderr_fd);
+        fclose($this->nullfd);
+    }
 }
 
 // error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING);
 require __DIR__ . '/../vendor/autoload.php';
-
+date_default_timezone_set('Asia/Shanghai');
+umask(0);
 
 $server_id = $argv[1];
 if (empty($server_id)) {
@@ -557,31 +614,46 @@ if (empty($server_id)) {
 
 define('SERVER_ID', $server_id);
 unset($server_id);
-// Process::signal(SIGCHLD, function ($sig) {
-//     //必须为false，非阻塞模式
-//     while ($ret = Process::wait(false)) {
-//         echo "PID={$ret['pid']}";
-//     }
-// });
 
-// 主动关闭了stdout|stderr，但是如果未重定向stdout则在有输出的情况下主进程无法启动。
+/* 主动关闭了stdout|stderr，
+* 但是如果未重定向stdout则在有输出的情况下主进程无法启动。
+* 如果指定了logfile，后续的输出如echo/var_dump/print_r 等都会输出到logfile。
+* 否则输出到 /dev/null */
 fclose(STDOUT);
 fclose(STDERR);
 
 $obj = new Processor();
+
 Co::set([
     'hook_flags' => SWOOLE_HOOK_ALL,
+    //下面的也没见起作用
     // 'chroot' => '',
-    'pid_file' => $obj->pidfile,
-    'open_tcp_keepalive' => true,
-    'tcp_keepidle' => 4,        //4s没有数据传输就进行检测
-    'tcp_keepinterval' => 1,    //1s探测一次
-    'tcp_keepcount' => 5,       //探测的次数，超过5次后还没回包close此连接
+    // 'pid_file' => $obj->pidfile,
+    // 'open_tcp_keepalive' => true,
+    // 'tcp_keepidle' => 4,        //4s没有数据传输就进行检测
+    // 'tcp_keepinterval' => 1,    //1s探测一次
+    // 'tcp_keepcount' => 5,       //探测的次数，超过5次后还没回包close此连接
 ]);
 
-$process = new Process(function () use ($obj) {
-    // Process::daemon();
-    $obj->run();
+set_exception_handler(function ($e) {
+    Logger::error($e->getMessage);
 });
+
+set_error_handler(function (int $errno, string $errstr, $errfile, $errline) {
+    Logger::error(sprintf("errno %s %s in %s on line %s", $errno, $errstr, $errfile, $errline));
+});
+
+
+/*
+- 调用异步风格服务端程序的 start 方法，此种启动方式会在事件回调中创建协程容器，参考 enable_coroutine。
+- 调用 Swoole 提供的 2 个进程管理模块 Process 和 Process\Pool 的 start 方法，此种启动方式会在进程启动的时候创建协程容器，参考这两个模块构造函数的 enable_coroutine 参数。
+- 其他直接裸写协程的方式启动程序，需要先创建一个协程容器 (Coroutine\run() 函数，可以理解为 java、c 的 main 函数)
+
+@see https://wiki.swoole.com/#/process/process
+*/
+Process::daemon(); //开启协程后必须放在new之前。
+$process = new Process(function () use ($obj) {
+    $obj->run();
+}, false, 0, true);
 $process->name('SwooleSched ' . SERVER_ID);
 $process->start();

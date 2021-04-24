@@ -44,7 +44,10 @@
 			echo '<hr>';
 			$size = isset($_GET['size']) && $_GET['size'] > 0 ? intval($_GET['size']) : 100;
 			echo '<pre>';
-			echo `tail -{$size}  $logfile`;
+			// STDOUT关闭之后被重定向，不能再使用tail了。
+			// echo `tail -{$size}  $logfile`;
+			
+			echo file_get_contents($logfile);
 			echo '</pre>';
 			?>
 

@@ -1,3 +1,7 @@
+<?php
+
+use Swoole\Timer;
+?>
 <!DOCTYPE html>
 <html lang="en">
 
@@ -20,19 +24,20 @@
         <?= $this->message ?>
         <span style="float:right">
           <font style="color: gray;">
-            serverId:<?= SERVER_ID ?>, 
-            ppid:<?= getmypid() ?>, 
-            createAt:<?= $this->createAt ?>, 
-            outofMin: <?= $this->outofMin ?>, 
+            serverId:<?= SERVER_ID ?>,
+            ppid:<?= getmypid() ?>,
+            createAt:<?= $this->createAt ?>,
+            outofMin: <?= $this->outofMin ?>,
             beDelIds:<?= count($this->beDelIds) ?>,
             childs:<?= count($this->childpids) ?>,
+            timers:<?= count($this->timerIds) . '=' . count(Timer::list()) ?>,
           </font>
         </span>
       </div>
 
       <ul class="clr" id="buttons">
         <li class="action-button"><a href="tail.php" target="_blank">tail log</a></li>
-        <li class="action-button"><a href="index.html?action=flush">flush cache</a></li>
+        <li class="action-button"><a href="index.html?action=flush">flush db cache</a></li>
         <li class="action-button">
           <select id='tagid' onchange="tagChange()">
             <option value="0">全部</option>
@@ -67,7 +72,7 @@
         <tbody>
           <?php
 
-          $id = isset($_GET['id']) ? $_GET['id'] : 0;
+          $id = $_GET['id'] ?? 0;
           if ($this->jobs)
             /** @var Job $c */
             foreach ($this->jobs as $c) {
@@ -93,8 +98,10 @@
                       <a href="index.html?md5=<?= $c->md5 ?>&action=start" name="Start">Start</a>
                     </li>
                   <?php } ?>
-                  <li>
-                    <a href="stderr.php?md5=<?= $c->md5 ?>&type=2" name="Tail -f Stderr" target="_blank">Tail -f Stderr</a>
+                  <?php if (is_numeric($c->cron) && isset($this->timerIds[$c->id])) { ?>
+                    <a href="index.html?md5=<?= $c->md5 ?>&action=clearTimer" name="clearTimer">clearTimer</a>
+                  <?php } ?>
+                  <li <a href="stderr.php?md5=<?= $c->md5 ?>&type=2" name="Tail -f Stderr" target="_blank">Tail -f Stderr</a>
                   </li>
                 </ul>
               </td>
@@ -103,7 +110,9 @@
               <td colspan="4">
                 <font style="color: gray;margin-left:77px;">
                   <?= $c->uptime . '~' . $c->endtime ?>&nbsp;&nbsp;|&nbsp;&nbsp;
-                  <?= $c->cron ?> <?= $c->command ?>
+                  <?php if (is_numeric($c->cron)) {
+                    echo '<font color=red>' . $c->cron . 'ms</font>';
+                  } ?> <?= $c->command ?>
                 </font>
               </td>
             </tr>

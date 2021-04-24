@@ -22,6 +22,11 @@ class Logger
         ];
     }
 
+    public static function getNames()
+    {
+        return array_flip(self::getLevels());
+    }
+
     public static function getName($level)
     {
         return self::getLevels()[$level];
@@ -56,7 +61,7 @@ class Logger
         if (is_string($msg))
             printf("%s [%s] %s" . PHP_EOL, date('Y-m-d H:i:s'), self::getName($level), $msg);
         else {
-            echo date('Y-m-d H:i:s') . '[' . $level . ']' . PHP_EOL;
+            echo date('Y-m-d H:i:s') . '[' . self::getName($level) . ']' . PHP_EOL;
             print_r($msg) . PHP_EOL;
         }
     }

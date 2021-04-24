@@ -117,6 +117,7 @@ HTTP/1.1 404 OK
 content-type: text/html
 $header
 
+
 EOF;
     }
 
@@ -130,6 +131,7 @@ Content-Type: text/plain
 Location: $location
 Cache-Control: no-cache
 $header
+
 
 EOF;
     }
