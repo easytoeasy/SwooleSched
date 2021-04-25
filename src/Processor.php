@@ -15,42 +15,37 @@ class Processor
     protected $jobs;
     protected $localip;
     protected $dbConfig;
-    protected $backlog = 10;
+    protected $backlog  = 10;
 
-    public $pidfile = '/var/run/swoolesched{%d}.pid';
-    protected $logfile = '/var/log/swoolesched{%d}.log';
-    protected $stdout  = '/var/log/stdout{%d}.log';
+    public $pidfile     = '/var/run/swoolesched{%d}.pid';
+    protected $logfile  = '/var/log/swoolesched{%d}.log';
+    protected $stdout   = '/var/log/stdout{%d}.log';
 
-    protected $message = 'Init Process OK';
+    protected $message  = 'Init Process OK';
     protected $outofMin = 0;
     protected $extSeconds = 1;
-    protected $childpids = array();
     /** 由于DB记录改变，内存中即将被删除的命令 */
     protected $beDelIds = array();
     /** 记录主进程启动的时间 */
     protected $createAt;
-    // protected $logger;
-    protected $level;
-    /* 黑洞实现 */
     protected $stdout_fd;
     protected $stderr_fd;
     protected $nullfd;
     protected $timerIds = array();
     protected $socket;
-    protected $tick = 1000; //时间事件(ms)+文件事件
+    protected $tick = 1000; //时间事件(ms)
     // protected $channel;
     /** 保存父进程退出之前的子进程pid */
     // protected $saveChildpids = __DIR__ . '/childsPids.pid';
     // protected $preChildpids = array();
 
-    const INIFILE = './swoolesched.ini';
+    const INIFILE = __DIR__ . '/swoolesched.ini';
 
     public function __construct()
     {
-        $this->createAt = date('Y-m-d H:i');
+        $this->createAt = date('m-d H:i');
         $this->_getLocalip();
         $this->_parseIni();
-        // $this->_initJobs();
 
         /* stdout 可以重定向，stderr无法重定向。*/
         if ($this->logfile) {
@@ -70,9 +65,6 @@ class Processor
 
         Logger::$level = $this->level;
         Logger::info('host:' . HOST . ', port:' . PORT);
-        // 本来想处理完READ事件之后，将response数据写入channel
-        // 然后在WRITE事件中在从channel读取数据返回给HTTP。可是似乎不行，WHY？
-        // $this->channel = new Co\Channel(1);
     }
 
     public function run()
@@ -80,7 +72,7 @@ class Processor
         if (is_file($this->pidfile)) {
             $pid = file_get_contents($this->pidfile);
             if ($this->isAlive($pid)) {
-                Logger::info('master alive' . PHP_EOL);
+                Logger::info('master alived and exitting' . PHP_EOL);
                 exit(0);
             }
             unset($pid);
@@ -89,9 +81,8 @@ class Processor
         $socket = new Co\Socket(AF_INET, SOCK_STREAM, 0);
         $socket->setOption(SOL_SOCKET, SO_REUSEADDR, 1);
         $socket->setOption(SOL_SOCKET, SO_REUSEPORT, 1);
-        // 不开启长连接，因为web请求并不多。但是调试要完整。调试结束
-        // 开启keepalive后，start|stop 请求一直处于pedding。
-        // 已处理：HTTP 返回的header多加一空行。可能是因为Swoole的读取按\r\n的原因。
+        // 可能是因为Sw send时按 \r\n 解析，所以在 HTTP 的response header 多加了一空行
+        // 否则 HTTP 无法正常解析header。
         $socket->setOption(SOL_SOCKET, SO_KEEPALIVE, 1);
         if ($socket->bind(HOST, PORT) === false) {
             socket_close($socket);
@@ -118,18 +109,12 @@ class Processor
         }
 
         $sigHandler = function ($signo) use ($socket) {
-            // if ($this->childpids)
-            //     file_put_contents($this->saveChildpids, json_encode($this->childpids));
-
-            // Swoole进程内使用exit会使进程立即退出。
-            // exit(0);
-
             try {
                 unlink($this->pidfile);
                 Logger::info('master Process exit code ' . $signo);
                 exit(0);
             } catch (Swoole\ExitException $e) {
-                Logger::info($e->getMessage());
+                Logger::error($e->getMessage());
             }
         };
 
@@ -141,6 +126,8 @@ class Processor
         file_put_contents($this->pidfile, getmypid());
 
         // 会导致协程id一直增加，如果协程id写爆了怎么办？会重新从0开始吗？
+        // 不能使用 Timer::clearall()，因为必须保证这个时间事件存在。和
+        // Event::dispatch() 结合使用。 
         Timer::tick($this->tick, function () {
         });
 
@@ -152,16 +139,14 @@ class Processor
                 if ($stamp >= $next) {
                     break;
                 }
-                /* dispatch 等待事件的发生，需要定一个超时时间才好。
-                 * 但是API又没有找到设置超时时间的参数。在epollfd是支持定义超时时间的啊！
-                 * 为什么在Swoole没找到呢？最后使用时间事件+文件事件。类似Redis。 */
+                // 时间事件+文件事件，防止文件事件长时间处于阻塞状态。
                 Event::dispatch();
                 $stamp = time();
             } while ($stamp < $next);
             $next = $stamp + $wait;
             $this->_startJobs();
             // 1min+1s内执行不完则记录
-            if (time() - $next > $wait + $this->extSeconds) {
+            if (time() - $next > $wait) {
                 $this->outofMin++;
             }
         }
@@ -170,27 +155,37 @@ class Processor
     private function _startJobs()
     {
         go(function () {
+            /* 先同步DB，再执行子进程。
+             * Timer一旦启动后，则不再受60s轮询的影响。
+             * 那么就要注意一个问题：syncDB将状态置成了DELETING，但是刚好此时Timer
+             * 将状态又置成了其他，那么就会丢失DELETING状态 */
             $this->syncFromDB();
             foreach ($this->jobs as &$job) {
-                // 支持ms||s级任务,单位是ms
+                if (!$this->isAllowedRun($job))
+                    continue;
+
+                // 支持ms级任务,单位是ms
                 if (is_numeric($job->cron)) {
                     if (isset($this->timerIds[$job->id]))
                         continue;
-                    Logger::info('add timer event, job id is ' . $job->id);
                     // Timer内会自动创建协程。
                     Timer::tick($job->cron, function ($timerid) use ($job) {
                         if (!isset($this->timerIds[$job->id])) {
-                            Logger::debug('timer id is ' . $timerid);
+                            Logger::info('add timer event, job id is ' . $job->id);
                             $this->timerIds[$job->id] = $timerid;
+                        }
+                        if ($job->state == State::DELETING && $job->refcount == 0) {
+                            Timer::clear($timerid);
+                            unset($this->timerIds[$job->id]);
+                            unset($this->beDelIds[$job->id]);
+                            unset($this->jobs[$job->md5]);
+                            unset($job);
+                            return;
                         }
                         $this->fork($job);
                     });
-                } else if ($this->isAllowedRun($job)) {
-                    /*
-                    由于在协程空间内 fork 进程会带着其他协程上下文，因此底层禁止了在 Coroutine 中使用 Process 模块。可以使用
-                    System::exec() 或 Runtime Hook+shell_exec 实现外面程序运行
-                    Runtime Hook+proc_open 实现父子进程交互通信
-                    */
+                } else {
+                    // 子任务的启动都会对应一个协程。
                     go(function () use ($job) {
                         $this->fork($job);
                     });
@@ -201,7 +196,8 @@ class Processor
 
     protected function fork(Job $job)
     {
-        if ($job->state == State::RUNNING || $job->state == State::DELETING) {
+        // 处于待删除的旧子进程，不再启动。
+        if ($job->state == State::DELETING || $job->state == State::RUNNING) {
             return;
         }
 
@@ -209,42 +205,31 @@ class Processor
         $desc[2] = $job->stderr ? ['file', $job->stderr, 'a'] : $this->nullfd;
         try {
             $proc = proc_open($job->command, $desc, $pipes);
-            if ($proc) {
-                $st = proc_get_status($proc);
-                if ($st['running'] === false) {
-                    $job->state = State::BACKOFF;
-                    proc_close($proc);
-                    return;
-                }
-                $job->pid = $st['pid'];
-                $this->childpids[$job->pid] = $job->md5;
-                $job->state = State::RUNNING;
-                $job->refcount++;
-                $job->uptime = date('H:i:s');
-                // Logger::info($job->id . ' start');
-                /* (1) 在非协程下，加上proc_close这行就会导致阻塞。
-                *      PHP手册提到这个函数会等待直到结束。
-                * (2) 但是在Swoole + 协程下，就是异步的了。
-                *      记得：hook + proc_open */
-                $code = proc_close($proc);
-                // Logger::debug($job->id . ' proc_close exitCode: ' . $code);
-                unset($this->childpids[$job->pid]);
-                $job->pid = 0;
-                $job->refcount--;
-                $job->endtime = date('H:i:s');
-                if ($code != 0) {
-                    $job->state = State::UNKNOWN;
-                } else {
-                    $job->state = State::STOPPED;
-                }
-            } else {
-                $job->state = State::FATAL;
+            if (!$proc) {
+                $job->state = $job->state == State::DELETING ? State::DELETING : State::UNKNOWN;
+                return;
             }
+            $st = proc_get_status($proc);
+            if ($st['running'] === false) {
+                $job->state = $job->state == State::DELETING ? State::DELETING : State::STOPPED;
+                proc_close($proc);
+                return;
+            }
+            $job->pid = $st['pid'];
+            $job->state = $job->state == State::DELETING ? State::DELETING : State::RUNNING;
+            $job->refcount++;
+            $job->uptime = date('H:i:s');
+            /* (1) 一般情况下 proc_close 这行就会导致阻塞。PHP手册提到这个函数会等待直到结束。
+             * (2) 但是在Swoole下，记得 hook + proc_open 异步处理 */
+            $code = proc_close($proc);
+            $job->pid = 0;
+            $job->refcount--;
+            $job->endtime = date('H:i:s');
+            $job->state = $job->state == State::DELETING ? State::DELETING : State::STOPPED;
         } catch (Exception $e) {
-            $job->state = State::FATAL;
+            $job->state = $job->state == State::DELETING ? State::DELETING : State::FATAL;
             Logger::error($e->getMessage());
         }
-        return;
     }
 
     protected function syncFromDB()
@@ -252,74 +237,23 @@ class Processor
         $db = new Db($this->dbConfig);
         $jobs = $db->getJobs();
         $this->servTags = $db->getServTags();
-
-        // if ($this->preChildpids)
-        //     foreach ($this->preChildpids as $pid => $md5) {
-        //         if (!$this->isAlive($pid)) {
-        //             ($this->jobs[$md5])->refcount--;
-        //             unset($this->preChildpids[$pid]);
-        //             if (empty($this->preChildpids)) {
-        //                 unlink($this->saveChildpids);
-        //             }
-        //         }
-        //     }
-
-
         if (empty($this->jobs)) {
-            // 保护父进程退出后的子进程不会发生重复执行
-            /*if (
-                is_file($this->saveChildpids) &&
-                ($saveChildPids = file_get_contents($this->saveChildpids))
-            ) {
-                $saveChildPids = json_decode($saveChildPids, true);
-                foreach ($saveChildPids as $pid => $md5) {
-                    if (isset($jobs[$md5]) && $this->isAlive($pid)) {
-                        ($jobs[$md5])->refcount++;
-                        ($jobs[$md5])->pid = $pid;
-                        ($jobs[$md5])->state = State::WAITING;
-                        // 不是当前父进程的子进程，保证还能够refcount--
-                        $this->preChildpids[$pid] = $md5;
-                    }
-                }
-            }*/
             $this->jobs = $jobs;
         }
-
-
-
         // DB里面变更的命令
         $newAdds = array_diff_key($jobs, $this->jobs);
-
         // 内存中等待被删除的命令
         $beDels = array_diff_key($this->jobs, $jobs);
 
-        /**
-         * 正在运行的任务不能清除
-         * 主进程每分钟跑一次，此时待删除的子进程可能需要运行数分钟。但是每分钟都会
-         * 执行到这里。直到待删除的子进程全部结束。
-         * 
-         * 增加了ms级定时任务之后，因为这个逻辑是每分钟执行。
-         * 所以毫秒级的任务在改变之后，先直接把原来的定时任务删除。然后在新增
-         */
         foreach ($beDels as $key => $value) {
-            $c = &$this->jobs[$key];
-
-            // 毫秒级任务直接从定时任务删除
-            if (isset($this->timerIds[$c->id])) {
-                $timerid = $this->timerIds[$c->id];
-                if (Timer::clear($timerid)) {
-                    Logger::debug('clear timer id is ' . $timerid);
-                    unset($this->timerIds[$c->id]);
-                }
-            } else if ($c->refcount > 0) { // cron任务等待子任务跑完在删除
-                $this->beDelIds[$c->id] = $c->id;
-                $c->state = State::DELETING;
-                continue;
+            $job = &$this->jobs[$key];
+            $this->beDelIds[$job->id] = $job->id;
+            $job->state = State::DELETING;
+            // cron 待删除的任务在同步DB时就删除
+            // Timer 待删除的任务在Timer定时任务中删除
+            if ($job->refcount == 0 && !is_numeric($job->cron)) {
+                unset($this->jobs[$key]);
             }
-
-            if (in_array($c->id, $this->beDelIds))
-                unset($this->beDelIds[$c->id]);
-            unset($this->jobs[$key]);
         }
 
         /** 
@@ -337,27 +271,36 @@ class Processor
     /**
      * 允许最大并行子进程
      *
-     * @param Job $c
+     * @param Job $job
      * @return bool
      */
-    protected function isAllowedRun(Job $c)
+    protected function isAllowedRun(Job $job)
     {
         // 该id对应的原子进程等待被删除，此时不能启动此id下的命令
-        // if (in_array($c->id, $this->beDelIds)) {
-        //     return false;
-        // }
-        if ($c->state == State::STARTING) {
-            return true;
-        }
-        // 说明设置的定时任务内没跑完
-        $cron = new CronExpression($c->cron);
-        if (!$cron->isDue()) {
+        if (in_array($job->id, $this->beDelIds)) {
             return false;
         }
-        if ($c->state == State::RUNNING) {
-            $c->outofCron++;
+
+        if ($job->state == State::STARTING) {
+            return true;
         }
-        if ($c->refcount >= $c->max_concurrence) {
+
+        if (is_numeric($job->cron)) {
+            if (isset($this->timerIds[$job->id])) {
+                return false;
+            }
+        } else {
+            // 说明设置的定时任务内没跑完
+            $cron = new CronExpression($job->cron);
+            if (!$cron->isDue()) {
+                return false;
+            }
+        }
+
+        if ($job->state == State::RUNNING) {
+            $job->outofCron++;
+        }
+        if ($job->refcount >= $job->max_concurrence) {
             return false;
         }
         return true;
@@ -388,11 +331,10 @@ class Processor
         $this->logfile = $ini['logfile'] ?? '';
         $this->output = $ini['stdout'] ?? '';
         $this->backlog = $ini['backlog'] ?? 16;
-        $this->level = $ini['loglevel'] ?? '';
-        if (!array_key_exists($this->level, Logger::getNames())) {
-            $this->level = Logger::INFO;
+        if (!array_key_exists($ini['loglevel'] ?? '', Logger::getNames())) {
+            Logger::$level = Logger::INFO;
         } else {
-            $this->level = Logger::getNames()[$this->level];
+            Logger::$level = Logger::getNames()[$ini['loglevel']];
         }
 
         $this->pidfile = str_replace('{%d}', SERVER_ID, $this->pidfile);
@@ -405,14 +347,6 @@ class Processor
         define('KEEPALIVE', boolval($ini['keepalive']) ?? false);
 
         unset($ini);
-    }
-
-    private function _initJobs()
-    {
-        $db = new Db($this->dbConfig);
-        $this->jobs = $db->getJobs();
-        $this->servTags = $db->getServTags();
-        unset($db);
     }
 
     private function _getLocalip()
@@ -517,23 +451,23 @@ class Processor
         $md5 = isset($_GET['md5']) ? $_GET['md5'] : '';
         $action = isset($_GET['action']) ? $_GET['action'] : '';
         if ($md5 && isset($this->jobs[$md5])) {
-            $c = &$this->jobs[$md5];
+            $job = &$this->jobs[$md5];
         }
 
         if (!empty($action)) {
-            $info = $c->id ?? '';
+            $info = $job->id ?? '';
             $this->message = sprintf("%s %s at %s", $action, $info, date('Y-m-d H:i:s'));
         }
 
         switch ($action) {
             case 'start':
-                if (!in_array($c->state, State::runingState())) {
-                    $c->state = State::STARTING;
+                if (!in_array($job->state, State::runingState())) {
+                    $job->state = State::STARTING;
                 }
                 break;
             case 'stop':
-                if ($c->state == State::RUNNING && $c->pid) {
-                    $rs = Process::kill($c->pid, SIGTERM);
+                if ($job->state == State::RUNNING && $job->pid) {
+                    $rs = Process::kill($job->pid, SIGTERM);
                     $this->message .= ' result:' . intval($rs);
                 }
                 break;
@@ -546,17 +480,17 @@ class Processor
                 $this->clearLog($this->logfile);
                 break;
             case 'clear_1':
-                $this->clearLog($c->output);
+                $this->clearLog($job->output);
                 break;
             case 'clear_2':
-                $this->clearLog($c->stderr);
+                $this->clearLog($job->stderr);
                 break;
             case 'clearTimer':
-                if (isset($this->timerIds[$c->id])) {
-                    $timerId = $this->timerIds[$c->id];
+                if (isset($this->timerIds[$job->id])) {
+                    $timerId = $this->timerIds[$job->id];
                     if (Timer::clear($timerId)) {
                         Logger::info('clear timer id is ' . $timerId);
-                        unset($this->timerIds[$c->id]);
+                        unset($this->timerIds[$job->id]);
                     }
                 }
                 break;

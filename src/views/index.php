@@ -24,12 +24,14 @@ use Swoole\Timer;
         <?= $this->message ?>
         <span style="float:right">
           <font style="color: gray;">
-            serverId:<?= SERVER_ID ?>,
-            ppid:<?= getmypid() ?>,
-            createAt:<?= $this->createAt ?>,
-            outofMin: <?= $this->outofMin ?>,
-            beDelIds:<?= count($this->beDelIds) ?>,
-            childs:<?= count($this->childpids) ?>,
+            servId:<?= SERVER_ID ?>,
+            pid:<?= getmypid() ?>,
+            at:<?= $this->createAt ?>,
+            outMin: <?= $this->outofMin ?>,
+            mem: <?= round(memory_get_usage()/1024/1024, 2) . 'M' ?>,
+            used: <?= round(memory_get_usage(true)/1024/1024, 2) . 'M' ?>,
+            jobs: <?= count($this->jobs) ?>,
+            delIds:<?= count($this->beDelIds) ?>,
             timers:<?= count($this->timerIds) . '=' . count(Timer::list()) ?>,
           </font>
         </span>
